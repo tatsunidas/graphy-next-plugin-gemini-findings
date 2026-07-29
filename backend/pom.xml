@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.example</groupId>
+    <artifactId>gemini-findings-backend</artifactId>
+    <version>0.1.0</version>
+    <packaging>jar</packaging>
+
+    <properties>
+        <maven.compiler.release>21</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <!--
+          対象 GRAPHY-Next のバージョン。Release に添付されている
+          graphy-plugin-api-<ver>.jar と一致させる。CI は -Dgraphy.version=… で上書きする。
+        -->
+        <graphy.version>0.1.8</graphy.version>
+    </properties>
+
+    <dependencies>
+        <!--
+          GraphyPlugin SPI。GRAPHY-Next がランタイムで供給するため provided（jar に同梱しない）。
+          この依存を解決するには、GRAPHY-Next の Release から graphy-plugin-api-<ver>.jar を落として
+          ローカルリポジトリへ登録する（README §5-2 参照）:
+
+            mvn install:install-file \
+              -Dfile=graphy-plugin-api-0.1.8.jar \
+              -DgroupId=com.vis.graphynext -DartifactId=graphy-plugin-api \
+              -Dversion=0.1.8 -Dpackaging=jar
+        -->
+        <dependency>
+            <groupId>com.vis.graphynext</groupId>
+            <artifactId>graphy-plugin-api</artifactId>
+            <version>${graphy.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!--
+          Jackson も provided。プラグイン JAR は「親＝backend のクラスローダ」付きで
+          ロードされるため、backend の依存が実行時に見える（同梱しなくてよい）。
+          ⚠ ただしこれは本体の実装詳細に寄りかかった選択で、本体の版が上がると壊れうる。
+             壊れたくないなら、この依存を外して JDK だけで JSON を組み立て・解釈すること。
+        -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>2.17.2</version>
+            <scope>provided</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <!-- plugin.json の id に合わせた jar 名にすると分かりやすい。 -->
+        <finalName>gemini-findings</finalName>
+    </build>
+</project>

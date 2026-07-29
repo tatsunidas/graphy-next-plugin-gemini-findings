@@ -1,0 +1,7 @@
+/site/
+target/
+node_modules/
+dist/
+pkg/
+*.key
+minisign.key

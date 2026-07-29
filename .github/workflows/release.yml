@@ -1,0 +1,113 @@
+# GRAPHY-Next プラグインのリリース（バックエンド面つき）。
+#
+# タグ v<version> を push すると:
+#   1. GRAPHY-Next の Release から graphy-plugin-api-<ver>.jar を取得してローカルへ登録
+#   2. backend/ を Maven でビルドして gemini-findings.jar を作る
+#   3. plugin.json / ui.js / *.jar を <id>-<version>.zip に固めて sha256 を付ける
+#   4. secrets があれば minisign で署名する
+#   5. GitHub Release に添付する
+name: Release plugin
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  # 対象 GRAPHY-Next の版。backend/pom.xml の <graphy.version> をこの値で上書きする。
+  # 本体を上げるときはここと plugin.json の engines.graphy を一緒に見直すこと。
+  GRAPHY_VERSION: "0.1.8"
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    env:
+      MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+      MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      # plugin.json の version とタグを突き合わせる。ずれたまま配ると、
+      # 利用者側の一覧表示と実際の中身が食い違うので、ここで落とす。
+      - name: Resolve id / version
+        id: meta
+        run: |
+          id=$(jq -r .id plugin.json)
+          pjver=$(jq -r .version plugin.json)
+          ver="${GITHUB_REF_NAME#v}"
+          if [ "$pjver" != "$ver" ]; then
+            echo "::error::plugin.json version ($pjver) != tag ($ver). 版とタグを一致させてください。"
+            exit 1
+          fi
+          echo "id=$id"   >> "$GITHUB_OUTPUT"
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+
+      # SPI は GRAPHY-Next の Release 資産。Maven Central には無いのでここで取得して登録する。
+      - name: Install graphy-plugin-api into local repository
+        run: |
+          gh release download "v${GRAPHY_VERSION}" \
+            --repo tatsunidas/GRAPHY-Next \
+            --pattern "graphy-plugin-api-*.jar" \
+            --dir /tmp/api
+          jar=$(ls /tmp/api/graphy-plugin-api-*.jar | head -n1)
+          echo "using $jar"
+          mvn -B -q install:install-file \
+            -Dfile="$jar" \
+            -DgroupId=com.vis.graphynext \
+            -DartifactId=graphy-plugin-api \
+            -Dversion="${GRAPHY_VERSION}" \
+            -Dpackaging=jar
+
+      - name: Build backend jar
+        run: |
+          mvn -B -q -f backend/pom.xml -Dgraphy.version="${GRAPHY_VERSION}" package
+          ls -la backend/target/*.jar
+
+      - name: Package zip (+ sha256)
+        run: |
+          name="${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.ver }}"
+          mkdir -p pkg dist
+          # 配布物に入れるのは実行に必要なファイルだけ。README や .d.ts、ソースは入れない。
+          cp plugin.json ui.js pkg/
+          cp backend/target/gemini-findings.jar pkg/
+          (cd pkg && zip -r "../dist/$name.zip" .)     # 直下に plugin.json（マネージャの前提）
+          (cd dist && sha256sum "$name.zip" > "$name.zip.sha256")
+          ls -la dist
+
+      # 署名（任意だが強く推奨）。secrets が未登録ならこのステップは自動でスキップされる。
+      # 署名があると、利用者は 2 回目以降の更新を確認画面なしで導入できる（TOFU）。
+      - name: Sign package (optional)
+        if: ${{ env.MINISIGN_SECRET_KEY != '' }}
+        run: |
+          if [ ! -f minisign.pub ]; then
+            echo "::error::minisign.pub がリポジトリにありません（minisign -G で作り、公開鍵だけコミットしてください）"
+            exit 1
+          fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          name="${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.ver }}"
+          printf '%s' "$MINISIGN_SECRET_KEY" > /tmp/minisign.key
+          printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s /tmp/minisign.key \
+            -m "dist/$name.zip" -t "$name" -x "dist/$name.zip.minisig"
+          rm -f /tmp/minisign.key
+          cp minisign.pub dist/
+          # 自分の公開鍵で検証できることを確認してから公開する。
+          minisign -V -p minisign.pub -m "dist/$name.zip" -x "dist/$name.zip.minisig"
+          ls -la dist
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.ver }}.zip
+            dist/${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.ver }}.zip.sha256
+            dist/${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.ver }}.zip.minisig
+            dist/minisign.pub

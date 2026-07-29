@@ -1,0 +1,3 @@
+# 改行は作業ツリーでも LF で統一する。Windows の core.autocrlf=true に引きずられて
+# CI のシェルスクリプトや yml が CRLF 化する事故を防ぐ。
+* text=auto eol=lf

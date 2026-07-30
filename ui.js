@@ -47,48 +47,72 @@ export function activate(host) {
 }
 
 // ── 表示中の画像を取り出す ────────────────────────────────────
+//
+// v0.1.9 以降は DOM を覗かない。開いているシリーズは host.getTargets() で分かり、
+// 画像は host.getPixelData()（生の画素）＋ host.getViewState()（W/L）から自分で焼く。
+// キャンバスを読んでいた頃より素直で、WebGL / 2D の違いにも影響されない。
 
 /**
- * 2D ビューアのタイルを列挙する。
+ * 送信用の画像を作る。**画素（HU 等）にビューアと同じ W/L を掛けて 8bit グレースケールへ焼く。**
  *
- * GRAPHY-Next は各タイルの外枠 <div> に data-tile-id="<studyUid>|<seriesUid>" を持たせている。
- * これは公式の host API ではなく DOM 依存なので、本体の版が上がると変わりうる。
+ * <p>ここで W/L を掛けるのは意図的である: 相手は視覚モデルなので、
+ * 「読影者が画面で見ているもの」に近い見た目を渡したい（HU の生値を渡しても解釈されない）。
+ * ただし本体の描画そのものではないため、注釈・オーバレイ・向きマーカーは含まれない。
  *
- * @returns {{tileId: string, seriesUid: string, canvas: HTMLCanvasElement, label: string}[]}
+ * @param {import('./graphy-plugin').Viewer2DPluginHost} host
+ * @param {string} tileId
+ * @returns {Promise<{base64: string, dataUrl: string, width: number, height: number} | null>}
  */
-function findOpenTiles() {
-  const out = [];
-  for (const el of document.querySelectorAll("[data-tile-id]")) {
-    const tileId = el.getAttribute("data-tile-id") || "";
-    const canvas = el.querySelector("canvas");
-    if (!tileId || !(canvas instanceof HTMLCanvasElement)) continue;
-    if (canvas.width === 0 || canvas.height === 0) continue;
-    const seriesUid = tileId.split("|")[1] || "";
-    const label = seriesUid.length <= 18 ? seriesUid : "…" + seriesUid.slice(-16);
-    out.push({ tileId, seriesUid, canvas, label });
+async function renderTileImage(host, tileId) {
+  const px = await host.getPixelData(tileId);
+  if (!px) return null;
+
+  // 表示と同じ濃淡にするため W/L はビューアから借りる（取れなければ値域から作る）。
+  const view = host.getViewState(tileId);
+  let center = view ? view.windowCenter : 0;
+  let width = view ? view.windowWidth : 0;
+  if (!(width > 0)) {
+    let min = Infinity;
+    let max = -Infinity;
+    for (const v of px.data) {
+      if (!Number.isFinite(v)) continue;
+      if (v < min) min = v;
+      if (v > max) max = v;
+    }
+    if (min === Infinity || !(max > min)) return null;
+    center = (min + max) / 2;
+    width = max - min;
   }
-  return out;
-}
 
-/**
- * キャンバスを PNG の base64（データ URL の接頭辞なし）にする。長辺を縮小する。
- *
- * Cornerstone3D のビューポート キャンバスは 2D の場合も WebGL の場合もあるため、
- * いったんオフスクリーンの 2D キャンバスへ drawImage してから toDataURL する。
- *
- * @returns {{base64: string, dataUrl: string, width: number, height: number} | null}
- */
-function captureCanvas(src) {
-  const scale = Math.min(1, MAX_IMAGE_EDGE / Math.max(src.width, src.height));
-  const w = Math.max(1, Math.round(src.width * scale));
-  const h = Math.max(1, Math.round(src.height * scale));
+  const full = new ImageData(px.cols, px.rows);
+  const lower = center - width / 2;
+  const scale255 = 255 / width;
+  for (let i = 0; i < px.data.length; i++) {
+    let g = Math.round((px.data[i] - lower) * scale255);
+    g = g < 0 ? 0 : g > 255 ? 255 : g;
+    const o = i * 4;
+    full.data[o] = g;
+    full.data[o + 1] = g;
+    full.data[o + 2] = g;
+    full.data[o + 3] = 255;
+  }
 
+  // いったん実寸で描いてから、長辺 MAX_IMAGE_EDGE に縮小する（送信量を抑える）。
+  const src = document.createElement("canvas");
+  src.width = px.cols;
+  src.height = px.rows;
+  const sctx = src.getContext("2d");
+  if (!sctx) return null;
+  sctx.putImageData(full, 0, 0);
+
+  const ratio = Math.min(1, MAX_IMAGE_EDGE / Math.max(px.cols, px.rows));
+  const w = Math.max(1, Math.round(px.cols * ratio));
+  const h = Math.max(1, Math.round(px.rows * ratio));
   const off = document.createElement("canvas");
   off.width = w;
   off.height = h;
   const ctx = off.getContext("2d");
   if (!ctx) return null;
-  // 黒背景を敷いてから描く（透明部分が白飛びしないように）。
   ctx.fillStyle = "#000";
   ctx.fillRect(0, 0, w, h);
   ctx.drawImage(src, 0, 0, w, h);
@@ -101,7 +125,12 @@ function captureCanvas(src) {
 // ── ダイアログ ───────────────────────────────────────────────
 
 function openDialog(host) {
-  const tiles = findOpenTiles();
+  // 開いているシリーズは公式 API で分かる（シリーズ名・モダリティ・スライス位置つき）。
+  const tiles = host.getTargets().map((t) => ({
+    tileId: t.tileId,
+    seriesUid: t.seriesUid,
+    label: `${t.seriesLabel} [${t.modality}] ${t.sliceIndex + 1}/${t.sliceCount}`,
+  }));
 
   const overlay = el("div", {
     position: "fixed",
@@ -226,18 +255,18 @@ function openDialog(host) {
   });
   panel.appendChild(preview);
 
-  const refreshPreview = () => {
+  const refreshPreview = async () => {
     if (!attach.box.checked || tiles.length === 0) {
       preview.style.display = "none";
       return;
     }
-    const shot = captureCanvas(tiles[Number(tileSel.value)].canvas);
+    const shot = await renderTileImage(host, tiles[Number(tileSel.value)].tileId);
     preview.src = shot ? shot.dataUrl : "";
     preview.style.display = shot ? "block" : "none";
   };
-  attach.box.onchange = refreshPreview;
-  tileSel.onchange = refreshPreview;
-  refreshPreview();
+  attach.box.onchange = () => void refreshPreview();
+  tileSel.onchange = () => void refreshPreview();
+  void refreshPreview();
 
   // ── 5. 確認
   panel.appendChild(sectionTitle("5. 確認"));
@@ -322,7 +351,7 @@ function openDialog(host) {
       findings: draft.value,
     };
     if (attach.box.checked && tiles.length > 0) {
-      const shot = captureCanvas(tiles[Number(tileSel.value)].canvas);
+      const shot = await renderTileImage(host, tiles[Number(tileSel.value)].tileId);
       if (shot) {
         payload.imageBase64 = shot.base64;
         payload.mimeType = "image/png";

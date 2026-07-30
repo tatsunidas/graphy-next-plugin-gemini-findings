@@ -1,14 +1,23 @@
 {
   "id": "gemini-findings",
   "name": "Gemini 所見推敲",
-  "version": "0.1.0",
-  "contributes": ["viewer2d.menu"],
+  "version": "0.2.0",
+  "contributes": [
+    "viewer2d.menu"
+  ],
   "ui": "ui.js",
   "entrypoint": "com.example.graphy.gemini.GeminiFindingsPlugin",
-  "permissions": ["read-pixels", "network"],
+  "permissions": [
+    "read-pixels",
+    "network"
+  ],
   "engines": {
-    "graphy": ">=0.1.8",
-    "os": ["win32", "darwin", "linux"]
+    "graphy": ">=0.1.9",
+    "os": [
+      "win32",
+      "darwin",
+      "linux"
+    ]
   },
   "description": "自分で書いた粗い所見と表示中の画像を Gemini に渡し、読影レポートとして通用する日本語へ推敲させる教育用サンプル（診断支援ではありません）。バックエンド面を持つためデスクトップ版でのみ動作します。",
   "author": "Visionary Imaging Services, Inc.",

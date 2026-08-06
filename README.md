@@ -17,7 +17,8 @@
 4. **Maven ビルドを含むリリース** — CI で API jar を取得してビルドし zip に同梱する
 5. **署名（minisign）と TOFU** — 実行コードを配るなら署名する
 
-- 対象: [GRAPHY-Next](https://github.com/tatsunidas/GRAPHY-Next) v0.1.8 以降
+- 対象: [GRAPHY-Next](https://github.com/tatsunidas/GRAPHY-Next) **v0.1.9 以降**
+  （`getTargets` / `getPixelData` / `getViewState` を使うため）
 - 動作モード: **デスクトップ版（standalone）のみ**。Web 版は `run()` が `501` になります（§9）
 - 姉妹デモ: [デモ集ハブ](https://github.com/tatsunidas/graphy-next-plugin-demos) ／
   [デモ 1: Hello](https://github.com/tatsunidas/graphy-next-plugin-hello) ／
@@ -155,7 +156,7 @@ LICENSE
   "ui": "ui.js",
   "entrypoint": "com.example.graphy.gemini.GeminiFindingsPlugin",
   "permissions": ["read-pixels", "network"],
-  "engines": { "graphy": ">=0.1.8", "os": ["win32", "darwin", "linux"] },
+  "engines": { "graphy": ">=0.1.9", "os": ["win32", "darwin", "linux"] },
   "description": "…", "author": "…", "homepage": "…", "license": "MIT"
 }
 ```
@@ -238,22 +239,32 @@ TypeScript を導入しなくても VS Code で `host` に補完が効きます�
 
 ### 4-1. 表示中の画像を取り出す
 
+開いているシリーズは **`host.getTargets()`** で分かります（シリーズ名・モダリティ・スライス位置つき）。
+
 ```js
-for (const el of document.querySelectorAll("[data-tile-id]")) {
-  const canvas = el.querySelector("canvas");   // Cornerstone3D のビューポート
-  …
-}
+const targets = host.getTargets();
+// [{ tileId, studyUid, seriesUid, seriesLabel, imageId, sliceIndex, sliceCount, c, t, modality }, …]
 ```
 
-GRAPHY-Next は 2D ビューアの各タイルの外枠 `<div>` に
-`data-tile-id="<studyUid>|<seriesUid>"` を持たせています。
+送る画像は、**画素（`host.getPixelData()`）にビューアの W/L（`host.getViewState()`）を掛けて
+自分で焼きます**。
 
-> ⚠ **これは公式の `host` API ではなく DOM 依存**です。本体の版が上がると変わりうる点に注意
-> してください（現状これが「いま何が開かれているか」を知る唯一の手段です）。
+```js
+const px = await host.getPixelData(tileId);     // Float32Array（CT なら HU）
+const view = host.getViewState(tileId);         // { windowCenter, windowWidth, … }
+// (value - (center - width/2)) * 255 / width を 0..255 にクランプして ImageData へ
+```
 
-キャンバスはいったんオフスクリーンの 2D キャンバスへ `drawImage` してから `toDataURL("image/png")`
-します（Cornerstone3D のキャンバスは 2D の場合も WebGL の場合もあるため、この経路なら両対応）。
-長辺 1024 px に縮小してからエンコードしています（リクエストを軽くするため）。
+**ここで W/L を掛けるのは意図的です。** 相手は視覚モデルなので、HU の生値ではなく
+「読影者が画面で見ているものに近い見た目」を渡したいからです。焼いた ImageData は
+オフスクリーン canvas 経由で長辺 1024 px に縮小し、`toDataURL("image/png")` で base64 にします
+（リクエストを軽くするため）。
+
+> **本体の描画そのものではありません。** 注釈・オーバレイ・向きマーカーは含まれず、
+> グレースケールの画素だけが渡ります。
+>
+> v0.1.8 以前は DOM の `data-tile-id` を探し、Cornerstone3D のキャンバスを読んでいました
+> （非公式・本体の版で壊れうる）。v0.1.9 以降は不要です。
 
 ### 4-2. なぜ外部 API を `ui.js` から直接呼ばないのか
 
@@ -679,9 +690,9 @@ minisign -V -p minisign.pub -m gemini-findings-0.1.0.zip -x gemini-findings-0.1.
 - **API キーは `localStorage` に平文で保存されます**（保存を選んだ場合）。
   プラグインから OS キーチェーンや本体の設定ストアへアクセスする API はありません。
 - **Web 版では動きません**（`run()` が `501`）。
-- **シリーズの生ピクセル（HU 等）に触れる公式 API はまだありません。**
-  添付する画像は表示中キャンバスのスクリーンショット相当（W/L 適用後の 8bit）です。
-- **`data-tile-id` は公式 API ではありません。** 本体の版が上がると変わりうる DOM 依存です。
+- **添付する画像は「本体の描画そのもの」ではありません。** 画素（HU）に W/L を掛けて焼いた
+  グレースケール画像で、注釈・オーバレイ・向きマーカーは含まれません（意図した挙動）。
+- **v0.1.8 以前の本体には導入できません**（`engines.graphy` が `">=0.1.9"`）。これは意図した挙動です。
 - **宣言 `permissions` は強制されません。** `"network"` と書かなくても通信できてしまいます。
 - **実行時の隔離がありません。** JAR はアプリと同じ権限（同一 JVM）で動きます。
 - **未署名プラグインの真正性は保証できません。** 同意画面は判断材料を出すだけです。

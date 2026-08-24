@@ -1,10 +1,11 @@
 # デモ 3: Gemini 所見推敲 — バックエンド面（Java JAR）から外部 API を呼ぶ
 
-自分で書いた**粗い所見のドラフト**と**表示中の画像**を Google の Gemini に渡し、
-読影レポートとして通用する日本語へ**推敲**させるプラグインです。
+自分で書いた**粗い所見のドラフト**と、スタディの**シリーズツリーから選んだ複数の画像**を
+Google の Gemini に渡し、読影レポートとして通用する日本語へ**推敲**させるプラグインです。
 
 ```
-人が粗く書く  →  画像を添付  →  JAR が Gemini に投げる  →  推敲後の所見 / 直した点 / 書き足す観点
+人が粗く書く  →  画像を選ぶ（造影前/後, T1/T2 …）  →  JAR が Gemini に投げる
+              →  推敲後の所見 / 直した点 / 書き足す観点
 ```
 
 これは **文章を書く練習のための教育用サンプル**であり、**診断支援ではありません**。
@@ -13,12 +14,15 @@
 
 1. **バックエンド面（Java JAR）**の作り方 — `GraphyPlugin` SPI の実装
 2. **なぜ外部 API は JAR から呼ぶのか** — レンダラの CSP
-3. **API キーの扱い** — どこに置き、どこに置かないか
-4. **Maven ビルドを含むリリース** — CI で API jar を取得してビルドし zip に同梱する
-5. **署名（minisign）と TOFU** — 実行コードを配るなら署名する
+3. **ui.js にできないことを JAR で埋める** — dcm4che で任意インスタンスをレンダリングする（§5-4）
+4. **API キーの扱い** — どこに置き、どこに置かないか
+5. **思考（thinking）モデルの出力上限** — 出力が途中で切れる原因と対処（§7-2）
+6. **Maven ビルドを含むリリース** — CI で API jar を取得してビルドし zip に同梱する
+7. **署名（minisign）と TOFU** — 実行コードを配るなら署名する
 
 - 対象: [GRAPHY-Next](https://github.com/tatsunidas/GRAPHY-Next) v0.1.8 以降
 - 動作モード: **デスクトップ版（standalone）のみ**。Web 版は `run()` が `501` になります（§9）
+- 出る場所: **2D ビューア**の Plug-ins メニュー ／ **DB 画面**の Plug-ins メニュー（選択中スタディが対象）
 - 姉妹デモ: [デモ集ハブ](https://github.com/tatsunidas/graphy-next-plugin-demos) ／
   [デモ 1: Hello](https://github.com/tatsunidas/graphy-next-plugin-hello) ／
   [デモ 2: 平均化フィルタ](https://github.com/tatsunidas/graphy-next-plugin-mean-filter)
@@ -236,24 +240,50 @@ TypeScript を導入しなくても VS Code で `host` に補完が効きます�
 // @ts-check
 ```
 
-### 4-1. 表示中の画像を取り出す
+### 4-1. 対象スタディを決める
+
+画像を選ぶには、まず「どのスタディの話か」を決める必要があります。サーフェスによって手段が違います。
+
+| サーフェス | 手段 | 公式 API か |
+|---|---|---|
+| `mainscreen.menu` | `host.selectedStudyUid` | ✅ 公式 |
+| `viewer2d.menu` | タイルの外枠 `<div>` の `data-tile-id="<studyUid>\|<seriesUid>"` を読む | ❌ DOM 依存 |
 
 ```js
 for (const el of document.querySelectorAll("[data-tile-id]")) {
-  const canvas = el.querySelector("canvas");   // Cornerstone3D のビューポート
+  const studyUid = (el.getAttribute("data-tile-id") || "").split("|")[0];
   …
 }
 ```
 
-GRAPHY-Next は 2D ビューアの各タイルの外枠 `<div>` に
-`data-tile-id="<studyUid>|<seriesUid>"` を持たせています。
+> ⚠ **後者は公式の `host` API ではなく DOM 依存**です。本体の版が上がると変わりうる点に注意
+> してください（現状これが 2D ビューアで「いま何が開かれているか」を知る唯一の手段です）。
+> DB 画面から使う場合は公式 API だけで完結します。
 
-> ⚠ **これは公式の `host` API ではなく DOM 依存**です。本体の版が上がると変わりうる点に注意
-> してください（現状これが「いま何が開かれているか」を知る唯一の手段です）。
+### 4-2. シリーズとインスタンスの一覧は REST から取る
 
-キャンバスはいったんオフスクリーンの 2D キャンバスへ `drawImage` してから `toDataURL("image/png")`
-します（Cornerstone3D のキャンバスは 2D の場合も WebGL の場合もあるため、この経路なら両対応）。
-長辺 1024 px に縮小してからエンコードしています（リクエストを軽くするため）。
+backend は同一オリジンなので、`ui.js` から素直に `fetch` できます（CSP の `connect-src 'self'` の内側）。
+オリジンは `import.meta.url` から求めます（`ui.js` は `/api/plugins/<id>/ui.js` として配信されるため）。
+
+```js
+const API_ORIGIN = new URL(import.meta.url).origin;
+
+// シリーズ一覧: [{ seriesInstanceUid, modality, seriesDescription, numberOfInstances, … }]
+await fetch(`${API_ORIGIN}/api/studies/${studyUid}/series`);
+
+// インスタンス一覧: [{ sopInstanceUid, instanceNumber, sopClassUid }]（InstanceNumber 昇順）
+await fetch(`${API_ORIGIN}/api/studies/${studyUid}/series/${seriesUid}/instances`);
+```
+
+これで**ツリー**は作れます。しかし**画素はここでは取れません** — 返るのは Part-10 の DICOM であって、
+`ui.js` にはそれをデコードする手段がありません（外部ライブラリは CSP で読み込めず、プラグインが
+配信できるファイルは `ui.js` 1 本だけです）。そこで**レンダリングは JAR 面に任せます**（§5-4）。
+
+> 📌 以前の版は「表示中のキャンバスを `toDataURL`」していました。それだと**開いている 1 枚**しか
+> 送れず、造影前後の比較のような使い方ができません。JAR 面でレンダリングすることで
+> 「開いていないインスタンスも選べる」ようになっています。
+
+### 4-3. なぜ外部 API を `ui.js` から直接呼ばないのか
 
 ### 4-2. なぜ外部 API を `ui.js` から直接呼ばないのか
 
@@ -271,10 +301,30 @@ connect-src 'self' http://localhost:* http://127.0.0.1:*
 `ui.js` の役目は「入力を集めて `host.runBackend()` に渡し、結果を表示する」ことに徹します。
 
 ```js
-const res = await host.runBackend({ apiKey, model, findings, imageBase64, mimeType });
+const res = await host.runBackend({
+  op: "refine", apiKey, model, instruction, findings,
+  images: [{ base64, mimeType, label }, …],
+});
 if (res.ok) showResult(res.text);
 else showError(res.error);
 ```
+
+### 4-4. 指示（プロンプト）を編集できるようにする
+
+`ui.js` の「3. 指示（プロンプト）」は編集でき、内容は `localStorage` に保存されます
+（キー `graphy-plugin.gemini-findings.instruction`）。次に開いたときも書き換えた指示のままです。
+
+ポイントは **既定文面を UI にコピーしないこと**。既定は JAR 側の `DEFAULT_INSTRUCTION` が正本で、
+UI は `op:"defaults"` で取得して初期値にします。UI 側にも同じ文字列を書くと、片方だけ直したときに
+必ず食い違います。
+
+```js
+const res = await host.runBackend({ op: "defaults" });   // → { ok, instruction }
+promptArea.value = localStorage.getItem(LS_PROMPT) || res.instruction;
+```
+
+「既定に戻す」は `localStorage` から消して `res.instruction` に戻すだけです。
+推敲時は `instruction` をそのまま渡し、**空なら JAR 側の既定が使われます**。
 
 ---
 
@@ -291,12 +341,16 @@ public interface GraphyPlugin {
 ```
 
 このデモの実装は `backend/src/main/java/com/example/graphy/gemini/GeminiFindingsPlugin.java` です。
-やっていることは単純で、
+`run()` は 1 つですが、`args.op` で 3 つの仕事に振り分けています。
 
-1. `args` から `apiKey` / `model` / `findings` / `imageBase64` を取り出す
-2. Gemini の `generateContent` 用 JSON を組み立てる
-3. JDK の `HttpClient` で POST する
-4. 応答から本文を取り出して `{ok, text, model, finishReason, usage}` として返す
+| `op` | 何をするか | 返すもの |
+|---|---|---|
+| `"refine"`（既定） | 指示＋ドラフト＋画像を Gemini に投げる | `{ok, text, model, finishReason, truncated, images, usage}` |
+| `"render"` | 指定インスタンスをレンダリングする（§5-4） | `{ok, base64, mimeType, width, height, window}` |
+| `"defaults"` | 既定の指示（プロンプト）を返す | `{ok, instruction}` |
+
+> 💡 **1 プラグイン＝1 エンドポイント**なので、複数の機能を持たせたいときはこのように
+> `op` で分岐します。`run()` を機能ごとに分けることはできません。
 
 ### 5-2. API jar に対してコンパイルする
 
@@ -313,12 +367,13 @@ mvn install:install-file \
 
 `pom.xml` では **`provided` スコープ**にします（ランタイムは GRAPHY-Next が供給するので、jar に同梱しない）。
 
-### 5-3. Jackson も `provided` で使える（が、寄りかかりでもある）
+### 5-3. Jackson / dcm4che も `provided` で使える（が、寄りかかりでもある）
 
 プラグイン JAR は **親＝backend のクラスローダ**付きでロードされます
 （`new URLClassLoader(urls, getClass().getClassLoader())`）。
 そのため **backend の依存（Spring, Jackson, dcm4che …）が実行時に見えます**。
-このデモは JSON の組み立て・解釈に Jackson を使い、`provided` で参照しています。
+このデモは JSON の組み立て・解釈に Jackson を、DICOM の読み取りに dcm4che を使い、
+どちらも `provided` で参照しています。
 
 ```xml
 <dependency>
@@ -329,11 +384,51 @@ mvn install:install-file \
 </dependency>
 ```
 
+```xml
+<dependency>
+  <groupId>org.dcm4che</groupId>
+  <artifactId>dcm4che-core</artifactId>
+  <version>5.34.3</version>
+  <scope>provided</scope>
+</dependency>
+```
+
 > ⚠ これは**本体の実装詳細に寄りかかった選択**です。本体の依存が変われば壊れます。
 > 壊れたくないなら、この依存を外して **JDK だけで**組み立て・解釈するか、
 > 必要なライブラリを shade して同梱してください（その場合 zip が大きくなります）。
+>
+> dcm4che は Maven Central にありません。`pom.xml` に `https://maven.dcm4che.org` の
+> `<repositories>` を足す必要があります。
 
-### 5-4. 例外を投げるか、値で返すか
+### 5-4. `op:"render"` — ui.js にできないことを JAR でやる
+
+このデモの**一番おいしいところ**です。
+
+`ui.js` が触れる画素は「表示中のキャンバス」だけで、**開いていないインスタンスは読めません**
+（host API に生画素を取る手段が無く、外部の DICOM ライブラリは CSP で読み込めません）。
+一方 JAR 面は backend の JVM 内で動くので、**dcm4che がそのまま使えます**。
+
+```
+ui.js: 「このインスタンスを描いて」  →  runBackend({op:"render", apiOrigin, studyUid, seriesUid, sopUid})
+JAR:   本体 REST から Part-10 を GET
+       → DicomInputStream で Attributes に読む
+       → Rescale(slope/intercept) → VOI(WindowCenter/Width) → 8bit
+       → 長辺 768px へ縮小 → PNG → base64 で返す
+ui.js: プレビューに表示し、そのまま Gemini への添付にも使い回す
+```
+
+3 つ、意図してそうしている点があります。
+
+- **画素は本体の REST 経由で取る。** JAR は保管庫のパスを知りませんが、
+  `/api/studies/{study}/series/{series}/instances/{sop}/file` を叩けば済みます。
+  この経路なら standalone（ローカル）でも web（PACS へ WADO-RS）でも同じコードで動きます。
+- **`apiOrigin` は UI から渡してもらい、ローカルホストだけを許可する。**
+  `ui.js` は `import.meta.url` から自分の出所を知っているので、それを渡すのが確実です。
+  ただし**外部入力なので検証は必須**です（任意のホストを取りに行かせない＝SSRF 対策）。
+- **非圧縮（ネイティブ）画素だけを扱う。** JPEG/JPEG-LS 等の圧縮転送構文をデコードするには
+  dcm4che のコーデック（opencv 版）が要ります。ここはデモなので、圧縮なら明示的にエラーを返します。
+
+### 5-5. 例外を投げるか、値で返すか
 
 想定内の失敗（キー未入力、Gemini が 400 を返した、など）は **例外を投げずに
 `{ok:false, error:"…"}` として返しています**。
@@ -342,18 +437,22 @@ mvn install:install-file \
 **利用者が対処できる失敗は、必ず値で返す**のが親切です。
 このデモは HTTP ステータスごとに補足（「API キーが無効か、API が有効化されていません」など）も付けています。
 
-### 5-5. 実行の流れ
+### 5-6. 実行の流れ
 
 ```
-メニュークリック → activate(host) → host.runBackend(payload)
-   → POST /api/plugins/gemini-findings/run
-   → backend が gemini-findings.jar を URLClassLoader でロード
-   → GeminiFindingsPlugin.run(payload)
-   → Gemini API へ HTTPS
-   → 戻り値 JSON が Promise で返る
+メニュークリック → activate(host)
+   → runBackend({op:"defaults"})   … 既定プロンプトを取得して編集欄に入れる
+   → シリーズツリーを REST で構築
+   → runBackend({op:"render", …})  … 選んだインスタンスを PNG にする（プレビュー／添付）
+   → runBackend({op:"refine", …})  … 指示＋ドラフト＋画像を Gemini へ
+        → POST /api/plugins/gemini-findings/run
+        → backend が gemini-findings.jar を URLClassLoader でロード
+        → GeminiFindingsPlugin.run(payload)
+        → Gemini API へ HTTPS
+        → 戻り値 JSON が Promise で返る
 ```
 
-### 5-6. 知っておくべき制約
+### 5-7. 知っておくべき制約
 
 - **Web 版では `run()` は常に `501`** を返します（共有 JVM に任意 JAR を読ませないため）。
 - **JAR は親クラスローダ付きでロードされる**ため、backend の依存が見えます（§5-3）。
@@ -380,9 +479,13 @@ mvn install:install-file \
 
 ---
 
-## 7. プロンプトの設計
+## 7. プロンプトとトークンの設計
 
-`GeminiFindingsPlugin.INSTRUCTION` に埋め込んであります。要点は 3 つです。
+### 7-1. 既定プロンプトの設計
+
+既定の文面は `GeminiFindingsPlugin.DEFAULT_INSTRUCTION` にあります（**アプリ上で書き換えられます**。
+書き換えた内容はこの端末に保存され、次回もそれが使われます。「既定に戻す」でいつでも戻せます）。
+要点は 3 つです。
 
 **① 診断させない。** 最優先の制約として、
 
@@ -403,6 +506,34 @@ mvn install:install-file \
 
 **③ 温度を下げる。** `generationConfig.temperature = 0.3`。
 推敲タスクで発散させても良いことはありません。
+
+**複数画像を渡すときのコツ:** 画像の直前に「画像1: CT / PRE LIVER #23」のようなラベルの
+`text` パートを挟みます。これが無いと、モデルは**どれが造影前でどれが造影後か**を知りようがありません。
+
+### 7-2. 出力が途中で切れる（`finishReason: MAX_TOKENS`）
+
+**Gemini 2.5 系は思考（thinking）モデルで、思考トークンも `maxOutputTokens` に含まれます。**
+初版は `maxOutputTokens: 2048` 固定だったため、思考で枠を使い切って本文が途中で切れていました
+（見た目には「文章が尻切れになる」だけで、原因が分かりにくい）。対処は 3 つ入れてあります。
+
+| 対処 | 実装 |
+|---|---|
+| 枠を広げる | `maxOutputTokens` を 8192 に |
+| 思考を切る | flash 系のみ `generationConfig.thinkingConfig.thinkingBudget = 0` |
+| 切れたら言う | `finishReason` を見て `truncated: true` を返し、UI が黄色の警告を出す |
+
+> ⚠ **`thinkingBudget: 0` を受け付けるのは flash 系だけ**です。pro 系は思考を無効化できず
+> 400 になるため、このデモは pro のときは何も指定せず動的思考のままにしています。
+
+思考を切ると**速く・安く**なり、無料枠のトークン節約にもなります。推敲は「書かれている内容を
+整える」作業で深い推論を必要としないため、切っても質はほとんど落ちません。
+応答のステータス行にはトークン数と**思考トークン数**を出しているので、効いているか確認できます。
+
+### 7-3. 無料枠で使うときの注意
+
+無料枠は **分あたり・日あたりのリクエスト数とトークン数**に上限があります。`429` が返ったときは
+レート制限なので、しばらく待って再実行してください（このデモはその旨を明示して返します）。
+画像は 1 枚あたり 768px に縮小して送っており、**枚数を増やすとそのぶん入力トークンが増えます**。
 
 ### 練習の進め方（提案）
 
@@ -655,10 +786,14 @@ minisign -V -p minisign.pub -m gemini-findings-0.1.0.zip -x gemini-findings-0.1.
 | `NoClassDefFoundError: com/fasterxml/…` | 本体の依存が変わった可能性。§5-3 の注意を参照（同梱するか、JDK だけで書き直す） |
 | Gemini が `401` / `403` | API キーが無効、または Generative Language API が有効化されていない |
 | Gemini が `404` | モデル名が存在しないか、そのキーで使えない。`gemini-2.5-flash` を試す |
-| Gemini が `429` | レート制限。しばらく待つ |
+| Gemini が `429` | レート制限。無料枠は分・日あたりの上限が低い。しばらく待つ（§7-3） |
+| **出力が途中で切れる** | `finishReason: MAX_TOKENS`。**思考トークンが枠を食っている**。§7-2 の対処が入っているか確認 |
 | 「本文が返りませんでした」 | セーフティでブロックされた可能性。返された `blockReason` / `finishReason` を確認 |
-| 画像が真っ黒で送られる | ビューアをクリック / スクロールして再描画してから実行する |
-| 「実行する」が押せない | §5 の確認チェックを入れる（意図的な仕様） |
+| ツリーにシリーズが出ない | 2D ビューアなら対象タイルを開く / DB 画面ならスタディを選択する。SR・SEG 等は意図的に隠している |
+| プレビューが「圧縮転送構文」エラー | JPEG 等はこのデモの範囲外（§5-4）。非圧縮のインスタンスで試す |
+| プレビューが出ない・遅い | 1 枚ごとに backend でレンダリングしている。初回だけ時間がかかる（以降はキャッシュ） |
+| 書き換えたプロンプトが戻ってしまう | `localStorage` を消していないか（ブラウザデータの削除・別ユーザープロファイル） |
+| 「推敲する」が押せない | §6 の確認チェックを入れる（意図的な仕様） |
 | 導入ボタンが押せない / `403` | 環境設定 ＞ プラグイン のトグルが OFF、または Web 版 |
 | 導入が `422` で拒否される | `engines.os` / `engines.graphy` が非対応、または zip 構造が不正 |
 | 「完全性を検証できません」 | Release に `<zip>.sha256` が無い。CI が付けているか確認 |
@@ -679,9 +814,15 @@ minisign -V -p minisign.pub -m gemini-findings-0.1.0.zip -x gemini-findings-0.1.
 - **API キーは `localStorage` に平文で保存されます**（保存を選んだ場合）。
   プラグインから OS キーチェーンや本体の設定ストアへアクセスする API はありません。
 - **Web 版では動きません**（`run()` が `501`）。
-- **シリーズの生ピクセル（HU 等）に触れる公式 API はまだありません。**
-  添付する画像は表示中キャンバスのスクリーンショット相当（W/L 適用後の 8bit）です。
-- **`data-tile-id` は公式 API ではありません。** 本体の版が上がると変わりうる DOM 依存です。
+- **シリーズの生ピクセル（HU 等）に触れる公式 host API はまだありません。**
+  このデモは JAR 面が dcm4che で自力で読んでいます（§5-4）。`ui.js` だけでは同じことはできません。
+- **画像は DICOM の既定ウィンドウでレンダリングされます。** ビューアで W/L を調整していても、
+  添付されるのは調整後の見た目ではありません（`WindowCenter`/`WindowWidth` タグの値を使います）。
+- **圧縮転送構文（JPEG 等）は描けません。** 非圧縮のみです（§5-4）。
+- **`data-tile-id` は公式 API ではありません。** 本体の版が上がると変わりうる DOM 依存です
+  （DB 画面から使う場合は `host.selectedStudyUid` だけで済み、この依存はありません）。
+- **プロンプトを書き換えると、安全側の制約もあなたの責任になります。**
+  既定の指示には「画像から新たな所見を診断しない」が入っています。外すこと自体は止められません。
 - **宣言 `permissions` は強制されません。** `"network"` と書かなくても通信できてしまいます。
 - **実行時の隔離がありません。** JAR はアプリと同じ権限（同一 JVM）で動きます。
 - **未署名プラグインの真正性は保証できません。** 同意画面は判断材料を出すだけです。

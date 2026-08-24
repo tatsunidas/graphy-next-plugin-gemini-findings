@@ -4,26 +4,44 @@
  * GRAPHY-Next プラグイン「Gemini 所見推敲」のフロント面。
  *
  * 流れ:
- *   人が粗い所見を書く → 表示中の画像を添付 → バックエンド面（JAR）が Gemini に投げる
- *   → 推敲後の所見・直した点・書き足す観点が返る
+ *   人が粗い所見を書く → スタディのシリーズツリーから画像を複数選ぶ
+ *   → バックエンド面（JAR）が Gemini に投げる → 推敲後の所見・直した点・書き足す観点が返る
  *
  * ── なぜ外部 API 呼び出しを ui.js から直接やらないのか ──────────────
  *  配布版 GRAPHY-Next のレンダラには CSP
  *    connect-src 'self' http://localhost:* http://127.0.0.1:*
  *  が効いており、ui.js から外部 API を fetch するとブロックされる。
  *  よって外部 API は **バックエンド面（gemini-findings.jar）から**呼ぶ。
- *  ui.js の役目は「入力を集めて host.runBackend() に渡し、結果を表示する」こと。
+ *
+ * ── なぜ画像のレンダリングも JAR 面なのか ────────────────────────
+ *  host API には「シリーズの生ピクセルを取る手段」が無く、ui.js が触れるのは
+ *  **表示中のキャンバス**だけ。つまり ui.js だけでは「開いていないインスタンス」を
+ *  見ることも送ることもできない。
+ *  一方 JAR 面は backend の JVM 内で動くので dcm4che が使え、任意のインスタンスを
+ *  読んで PNG にできる（op:"render"）。ここがバックエンド面の見せ場。
  *
  * ── 安全上の前提 ─────────────────────────────────────────────
  *  画像とテキストは Google のサーバーへ送信される。実患者データを送ってはならない。
  *  ダイアログは、確認チェックを入れるまで実行できないようにしてある。
  */
 
+/** backend のオリジン。ui.js は /api/plugins/<id>/ui.js として配信されるので自分の URL から求まる。 */
+const API_ORIGIN = new URL(import.meta.url).origin;
+
 /** localStorage のキー。プラグイン id を前置して他と衝突させない。 */
 const LS_KEY = "graphy-plugin.gemini-findings.apiKey";
 
-/** 添付画像の最大辺（px）。大きすぎるとリクエストが重くなるので縮小する。 */
-const MAX_IMAGE_EDGE = 1024;
+/** 書き換えた指示（プロンプト）の保存先。Gems のように自分用の指示を育てられるようにする。 */
+const LS_PROMPT = "graphy-plugin.gemini-findings.instruction";
+
+/** 添付できる画像の上限（JAR 側も同じ値で頭打ちにしている）。 */
+const MAX_IMAGES = 8;
+
+/** JAR にレンダリングさせるときの長辺（px）。プレビューと送信で同じ画像を使い回す。 */
+const RENDER_EDGE = 768;
+
+/** ツリーに出さないモダリティ（画像ではない・このデモでは描けないもの）。 */
+const HIDDEN_MODALITIES = new Set(["SR", "PR", "KO", "RTSTRUCT", "RTPLAN", "SEG"]);
 
 /** 練習用の粗いドラフト。わざと口語・省略まじりにしてある。 */
 const SAMPLE_DRAFT = `右上葉に結節。2cmくらい。辺縁ぎざぎざ。
@@ -34,74 +52,68 @@ const SAMPLE_DRAFT = `右上葉に結節。2cmくらい。辺縁ぎざぎざ。
 const MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"];
 
 /**
- * プラグインの入口。2D ビューアの Plug-ins メニューから呼ばれる。
+ * プラグインの入口。2D ビューア／DB 画面の Plug-ins メニューから呼ばれる。
  *
  * @param {import('./graphy-plugin').PluginHost} host
  */
 export function activate(host) {
-  if (host.surface === "mainscreen.menu") {
-    host.notify("このプラグインは 2D ビューアの Plug-ins メニューから実行してください。");
-    return;
-  }
-  openDialog(host);
+  openDialog(host, studyCandidates(host));
 }
 
-// ── 表示中の画像を取り出す ────────────────────────────────────
+// ── 対象スタディを決める ──────────────────────────────────────
 
 /**
- * 2D ビューアのタイルを列挙する。
+ * 対象になりうる studyInstanceUID を集める。
  *
- * GRAPHY-Next は各タイルの外枠 <div> に data-tile-id="<studyUid>|<seriesUid>" を持たせている。
- * これは公式の host API ではなく DOM 依存なので、本体の版が上がると変わりうる。
+ * - mainscreen.menu … ホストが選択中スタディを渡してくれる（公式の host API）。
+ * - viewer2d.menu … タイルの外枠 <div> の data-tile-id="<studyUid>|<seriesUid>" から拾う。
+ *   これは公式 API ではなく DOM 依存なので、本体の版が上がると変わりうる。
  *
- * @returns {{tileId: string, seriesUid: string, canvas: HTMLCanvasElement, label: string}[]}
+ * @param {import('./graphy-plugin').PluginHost} host
+ * @returns {string[]}
  */
-function findOpenTiles() {
-  const out = [];
+function studyCandidates(host) {
+  if (host.surface === "mainscreen.menu") {
+    return host.selectedStudyUid ? [host.selectedStudyUid] : [];
+  }
+  const seen = [];
   for (const el of document.querySelectorAll("[data-tile-id]")) {
     const tileId = el.getAttribute("data-tile-id") || "";
-    const canvas = el.querySelector("canvas");
-    if (!tileId || !(canvas instanceof HTMLCanvasElement)) continue;
-    if (canvas.width === 0 || canvas.height === 0) continue;
-    const seriesUid = tileId.split("|")[1] || "";
-    const label = seriesUid.length <= 18 ? seriesUid : "…" + seriesUid.slice(-16);
-    out.push({ tileId, seriesUid, canvas, label });
+    const studyUid = tileId.split("|")[0];
+    if (studyUid && !seen.includes(studyUid)) seen.push(studyUid);
   }
-  return out;
+  return seen;
 }
 
-/**
- * キャンバスを PNG の base64（データ URL の接頭辞なし）にする。長辺を縮小する。
- *
- * Cornerstone3D のビューポート キャンバスは 2D の場合も WebGL の場合もあるため、
- * いったんオフスクリーンの 2D キャンバスへ drawImage してから toDataURL する。
- *
- * @returns {{base64: string, dataUrl: string, width: number, height: number} | null}
- */
-function captureCanvas(src) {
-  const scale = Math.min(1, MAX_IMAGE_EDGE / Math.max(src.width, src.height));
-  const w = Math.max(1, Math.round(src.width * scale));
-  const h = Math.max(1, Math.round(src.height * scale));
+// ── backend の REST（同一オリジンなので ui.js から直接叩ける） ────────
 
-  const off = document.createElement("canvas");
-  off.width = w;
-  off.height = h;
-  const ctx = off.getContext("2d");
-  if (!ctx) return null;
-  // 黒背景を敷いてから描く（透明部分が白飛びしないように）。
-  ctx.fillStyle = "#000";
-  ctx.fillRect(0, 0, w, h);
-  ctx.drawImage(src, 0, 0, w, h);
+async function getJson(path) {
+  const res = await fetch(API_ORIGIN + path);
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${path}`);
+  return res.json();
+}
 
-  const dataUrl = off.toDataURL("image/png");
-  const comma = dataUrl.indexOf(",");
-  return { base64: dataUrl.slice(comma + 1), dataUrl, width: w, height: h };
+/** スタディのシリーズ一覧。 */
+function fetchSeries(studyUid) {
+  return getJson(`/api/studies/${encodeURIComponent(studyUid)}/series`);
+}
+
+/** シリーズのインスタンス一覧（InstanceNumber 昇順で返る）。 */
+function fetchInstances(studyUid, seriesUid) {
+  return getJson(
+    `/api/studies/${encodeURIComponent(studyUid)}/series/${encodeURIComponent(seriesUid)}/instances`,
+  );
 }
 
 // ── ダイアログ ───────────────────────────────────────────────
 
-function openDialog(host) {
-  const tiles = findOpenTiles();
+function openDialog(host, studyUids) {
+  /** レンダリング結果のキャッシュ。key = sopUid。 */
+  const rendered = new Map();
+  /** 選択中インスタンス。key = sopUid、値はラベル等。Map なので選んだ順が保たれる。 */
+  const selected = new Map();
+
+  let studyUid = studyUids[0] || null;
 
   const overlay = el("div", {
     position: "fixed",
@@ -120,7 +132,7 @@ function openDialog(host) {
     border: "1px solid #2a3550",
     borderRadius: "10px",
     padding: "16px 18px",
-    width: "min(880px, 94vw)",
+    width: "min(980px, 96vw)",
     maxHeight: "92vh",
     overflow: "auto",
     boxShadow: "0 20px 60px rgba(0,0,0,0.6)",
@@ -179,68 +191,187 @@ function openDialog(host) {
     modelSel.appendChild(o);
   }
   panel.appendChild(modelSel);
+  panel.appendChild(
+    hint(
+      "flash は思考（thinking）を切って呼び出します（速く・安く・出力が途中で切れにくい）。" +
+        "pro は思考を無効化できない仕様のため、そのぶん出力トークンを厚めに取ります。",
+    ),
+  );
 
-  // ── 3. ドラフト
-  panel.appendChild(sectionTitle("3. 所見のドラフト（自分で書く）"));
+  // ── 3. 指示（プロンプト）— Gems のように書き換えられる
+  //
+  // 既定の文面は JAR 側の DEFAULT_INSTRUCTION が正本で、ここは op:"defaults" で取得して
+  // 初期値にするだけ。UI 側に同じ文面をコピーすると必ず食い違うので、そうしない。
+  const promptDetails = document.createElement("details");
+  Object.assign(promptDetails.style, { marginTop: "14px" });
+  const promptSummary = document.createElement("summary");
+  Object.assign(promptSummary.style, { cursor: "pointer", fontWeight: "700", marginBottom: "6px" });
+  promptSummary.textContent = "3. 指示（プロンプト）— 書き換えられます";
+  promptDetails.appendChild(promptSummary);
+  panel.appendChild(promptDetails);
+
+  const promptArea = document.createElement("textarea");
+  styleInput(promptArea);
+  Object.assign(promptArea.style, {
+    width: "100%",
+    minHeight: "180px",
+    resize: "vertical",
+    maxWidth: "none",
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+    fontSize: "12px",
+    lineHeight: "1.6",
+  });
+  promptArea.value = localStorage.getItem(LS_PROMPT) || "";
+  promptArea.placeholder = "既定の指示を読み込み中…";
+  promptDetails.appendChild(promptArea);
+
+  const promptBar = row();
+  Object.assign(promptBar.style, { marginTop: "6px" });
+  const resetPromptBtn = button("既定に戻す", "#39415a");
+  const promptState = el("span", { color: "#93a1b8", fontSize: "11.5px" });
+  promptBar.appendChild(resetPromptBtn);
+  promptBar.appendChild(promptState);
+  promptDetails.appendChild(promptBar);
+  promptDetails.appendChild(
+    hint(
+      "この指示がドラフトと画像の前に置かれます。書き換えるとこの端末に保存され、次回もそれが使われます。" +
+        "⚠ 既定の指示には「画像から新たな所見を診断しない」という制約が入っています。" +
+        "外すかどうかは書き換えた人の責任です。",
+    ),
+  );
+
+  /** 既定の指示は JAR から取得する（op:"defaults"）。 */
+  let defaultInstruction = "";
+  (async () => {
+    try {
+      const res = /** @type {any} */ (await host.runBackend({ op: "defaults" }));
+      defaultInstruction = (res && res.instruction) || "";
+      if (!promptArea.value) promptArea.value = defaultInstruction;
+      promptArea.placeholder = "";
+      updatePromptState();
+    } catch (e) {
+      promptArea.placeholder = explainBackendError(e);
+    }
+  })();
+
+  function updatePromptState() {
+    const custom = defaultInstruction !== "" && promptArea.value.trim() !== defaultInstruction.trim();
+    promptState.textContent = custom
+      ? "カスタム（この端末に保存済み・次に開いてもこの内容です）"
+      : "既定のまま";
+    // ボタンは常に見せる（機能があると分かるように）。既定のままなら押せないだけにする。
+    resetPromptBtn.disabled = !custom;
+    resetPromptBtn.style.opacity = custom ? "1" : "0.45";
+    resetPromptBtn.style.cursor = custom ? "pointer" : "not-allowed";
+    promptSummary.textContent = "3. 指示（プロンプト）— 書き換えられます" + (custom ? "  ※カスタム" : "");
+  }
+
+  promptArea.oninput = () => {
+    if (promptArea.value.trim() === defaultInstruction.trim()) localStorage.removeItem(LS_PROMPT);
+    else localStorage.setItem(LS_PROMPT, promptArea.value);
+    updatePromptState();
+  };
+  resetPromptBtn.onclick = () => {
+    promptArea.value = defaultInstruction;
+    localStorage.removeItem(LS_PROMPT);
+    updatePromptState();
+  };
+  updatePromptState();
+
+  // ── 4. ドラフト
+  panel.appendChild(sectionTitle("4. 所見のドラフト（自分で書く）"));
   const draft = document.createElement("textarea");
   styleInput(draft);
-  Object.assign(draft.style, { width: "100%", minHeight: "120px", resize: "vertical", maxWidth: "none" });
+  Object.assign(draft.style, { width: "100%", minHeight: "110px", resize: "vertical", maxWidth: "none" });
   draft.value = SAMPLE_DRAFT;
   panel.appendChild(draft);
   panel.appendChild(
     hint("まず自分の言葉で書くのが練習の主眼です。粗くて構いません（サンプルもわざと粗く書いてあります）。"),
   );
 
-  // ── 4. 画像
-  panel.appendChild(sectionTitle("4. 添付する画像"));
-  const imgRow = row();
-  const attach = checkbox("表示中の画像を添付する", tiles.length > 0);
-  imgRow.appendChild(attach.wrap);
+  // ── 5. 画像（シリーズツリー＋プレビュー）
+  panel.appendChild(sectionTitle("5. 添付する画像（インスタンス単位で複数選択）"));
+  panel.appendChild(
+    hint(
+      "例: CT なら造影前と造影後の同じレベル、MRI なら同じレベルの T2 と T1。" +
+        `選んだ順に「画像1, 画像2 …」として渡されます（最大 ${MAX_IMAGES} 枚）。`,
+    ),
+  );
 
-  const tileSel = document.createElement("select");
-  styleInput(tileSel);
-  tiles.forEach((t, i) => {
-    const o = document.createElement("option");
-    o.value = String(i);
-    o.textContent = t.label;
-    tileSel.appendChild(o);
-  });
-  if (tiles.length === 0) {
-    attach.box.checked = false;
-    attach.box.disabled = true;
-    const o = document.createElement("option");
-    o.textContent = "（2D ビューアに画像がありません）";
-    tileSel.appendChild(o);
-    tileSel.disabled = true;
-  }
-  imgRow.appendChild(tileSel);
-  panel.appendChild(imgRow);
-
-  const preview = document.createElement("img");
-  Object.assign(preview.style, {
-    marginTop: "8px",
-    maxWidth: "220px",
-    border: "1px solid #2a3550",
-    borderRadius: "6px",
-    display: "none",
-  });
-  panel.appendChild(preview);
-
-  const refreshPreview = () => {
-    if (!attach.box.checked || tiles.length === 0) {
-      preview.style.display = "none";
-      return;
+  // 複数のスタディが開いているときだけ選択させる。
+  if (studyUids.length > 1) {
+    const studyRow = row();
+    studyRow.appendChild(labelled("対象スタディ"));
+    const studySel = document.createElement("select");
+    styleInput(studySel);
+    for (const uid of studyUids) {
+      const o = document.createElement("option");
+      o.value = uid;
+      o.textContent = shortUid(uid);
+      studySel.appendChild(o);
     }
-    const shot = captureCanvas(tiles[Number(tileSel.value)].canvas);
-    preview.src = shot ? shot.dataUrl : "";
-    preview.style.display = shot ? "block" : "none";
-  };
-  attach.box.onchange = refreshPreview;
-  tileSel.onchange = refreshPreview;
-  refreshPreview();
+    studySel.onchange = () => {
+      studyUid = studySel.value;
+      selected.clear();
+      refreshSelection();
+      buildTree();
+    };
+    studyRow.appendChild(studySel);
+    Object.assign(studyRow.style, { marginBottom: "8px" });
+    panel.appendChild(studyRow);
+  }
 
-  // ── 5. 確認
-  panel.appendChild(sectionTitle("5. 確認"));
+  const browser = el("div", { display: "flex", gap: "12px", alignItems: "stretch", marginTop: "6px" });
+  panel.appendChild(browser);
+
+  const treeBox = el("div", {
+    flex: "1 1 380px",
+    minWidth: "0",
+    maxHeight: "300px",
+    overflow: "auto",
+    background: "#0f1626",
+    border: "1px solid #2a3550",
+    borderRadius: "8px",
+    padding: "6px",
+  });
+  browser.appendChild(treeBox);
+
+  const previewBox = el("div", {
+    flex: "0 0 300px",
+    display: "flex",
+    flexDirection: "column",
+    gap: "6px",
+    alignItems: "center",
+    justifyContent: "center",
+    background: "#0f1626",
+    border: "1px solid #2a3550",
+    borderRadius: "8px",
+    padding: "8px",
+    minHeight: "200px",
+  });
+  browser.appendChild(previewBox);
+
+  const previewImg = document.createElement("img");
+  Object.assign(previewImg.style, {
+    maxWidth: "100%",
+    maxHeight: "240px",
+    borderRadius: "4px",
+    display: "none",
+    background: "#000",
+  });
+  const previewCaption = el("div", { color: "#93a1b8", fontSize: "11.5px", textAlign: "center" });
+  previewCaption.textContent = "インスタンスを選ぶとここに表示されます";
+  previewBox.appendChild(previewImg);
+  previewBox.appendChild(previewCaption);
+
+  const selectionInfo = el("div", { marginTop: "8px", color: "#93a1b8", fontSize: "12px" });
+  panel.appendChild(selectionInfo);
+
+  const thumbs = el("div", { display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "6px" });
+  panel.appendChild(thumbs);
+
+  // ── 6. 確認
+  panel.appendChild(sectionTitle("6. 確認"));
   const consent = checkbox(
     "送信する画像とテキストは実患者データではなく、外部送信してよいことを確認しました",
     false,
@@ -266,6 +397,18 @@ function openDialog(host) {
 
   const status = el("div", { marginTop: "10px", color: "#93a1b8", fontSize: "12px", minHeight: "1.4em" });
   panel.appendChild(status);
+
+  const truncWarn = el("div", {
+    marginTop: "8px",
+    display: "none",
+    background: "rgba(234,179,8,0.12)",
+    border: "1px solid rgba(234,179,8,0.5)",
+    borderRadius: "8px",
+    padding: "8px 10px",
+    fontSize: "12px",
+    lineHeight: "1.6",
+  });
+  panel.appendChild(truncWarn);
 
   const result = el("div", {
     marginTop: "10px",
@@ -305,7 +448,220 @@ function openDialog(host) {
   };
   document.addEventListener("keydown", onKey);
 
-  // ── 実行本体
+  // ── ツリー ────────────────────────────────────────────────
+
+  /** シリーズ一覧を読んでツリーを組み直す。 */
+  async function buildTree() {
+    treeBox.textContent = "";
+    if (!studyUid) {
+      const msg = el("div", { color: "#93a1b8", fontSize: "12px", padding: "8px", lineHeight: "1.7" });
+      msg.textContent =
+        host.surface === "mainscreen.menu"
+          ? "スタディが選択されていません。一覧でスタディを選んでから実行してください。（画像なしでも推敲はできます）"
+          : "2D ビューアにシリーズが開かれていません。（画像なしでも推敲はできます）";
+      treeBox.appendChild(msg);
+      return;
+    }
+
+    const loading = el("div", { color: "#93a1b8", fontSize: "12px", padding: "8px" });
+    loading.textContent = "シリーズを読み込み中…";
+    treeBox.appendChild(loading);
+
+    let list;
+    try {
+      list = await fetchSeries(studyUid);
+    } catch (e) {
+      loading.textContent = "シリーズ一覧を取得できませんでした: " + e;
+      return;
+    }
+    treeBox.textContent = "";
+
+    const shown = list.filter((s) => !HIDDEN_MODALITIES.has(String(s.modality || "").toUpperCase()));
+    if (shown.length === 0) {
+      const msg = el("div", { color: "#93a1b8", fontSize: "12px", padding: "8px" });
+      msg.textContent = "表示できるシリーズがありません。";
+      treeBox.appendChild(msg);
+      return;
+    }
+    if (shown.length < list.length) {
+      treeBox.appendChild(
+        hint(`画像ではないシリーズ（${[...HIDDEN_MODALITIES].join(", ")}）は隠しています。`),
+      );
+    }
+
+    for (const s of shown) treeBox.appendChild(seriesNode(s));
+  }
+
+  /** シリーズ 1 行（クリックで展開してインスタンスを並べる）。 */
+  function seriesNode(series) {
+    const wrap = el("div", { marginBottom: "2px" });
+
+    const head = el("div", {
+      display: "flex",
+      gap: "6px",
+      alignItems: "center",
+      cursor: "pointer",
+      padding: "5px 6px",
+      borderRadius: "5px",
+      userSelect: "none",
+    });
+    const caret = el("span", { color: "#93a1b8", width: "10px", flex: "0 0 10px" });
+    caret.textContent = "▸";
+    const label = el("span", { fontWeight: "600" });
+    label.textContent = seriesLabel(series);
+    const count = el("span", { color: "#93a1b8", fontSize: "11.5px", marginLeft: "auto" });
+    count.textContent = `${series.numberOfInstances ?? "?"} 枚`;
+    head.appendChild(caret);
+    head.appendChild(label);
+    head.appendChild(count);
+    head.onmouseenter = () => (head.style.background = "#1b2438");
+    head.onmouseleave = () => (head.style.background = "transparent");
+    wrap.appendChild(head);
+
+    const body = el("div", { display: "none", paddingLeft: "16px" });
+    wrap.appendChild(body);
+
+    let loaded = false;
+    head.onclick = async () => {
+      const open = body.style.display !== "none";
+      body.style.display = open ? "none" : "block";
+      caret.textContent = open ? "▸" : "▾";
+      if (open || loaded) return;
+      loaded = true;
+      body.textContent = "";
+      const loading = el("div", { color: "#93a1b8", fontSize: "12px", padding: "4px 6px" });
+      loading.textContent = "読み込み中…";
+      body.appendChild(loading);
+      try {
+        const instances = await fetchInstances(studyUid, series.seriesInstanceUid);
+        body.textContent = "";
+        for (const inst of instances) body.appendChild(instanceNode(series, inst));
+      } catch (e) {
+        loading.textContent = "インスタンス一覧を取得できませんでした: " + e;
+        loaded = false;
+      }
+    };
+
+    return wrap;
+  }
+
+  /** インスタンス 1 行（チェックで選択・クリックでプレビュー）。 */
+  function instanceNode(series, inst) {
+    const sop = inst.sopInstanceUid;
+    const label = `${seriesLabel(series)} #${inst.instanceNumber ?? "?"}`;
+
+    const line = el("div", {
+      display: "flex",
+      gap: "6px",
+      alignItems: "center",
+      padding: "3px 6px",
+      borderRadius: "5px",
+      cursor: "pointer",
+    });
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = selected.has(sop);
+    box.onclick = (e) => e.stopPropagation(); // 行クリック（プレビュー）と分ける
+    box.onchange = () => {
+      if (box.checked) {
+        if (selected.size >= MAX_IMAGES) {
+          box.checked = false;
+          host.notify(`添付できるのは ${MAX_IMAGES} 枚までです。`);
+          return;
+        }
+        selected.set(sop, { studyUid, seriesUid: series.seriesInstanceUid, sopUid: sop, label });
+      } else {
+        selected.delete(sop);
+      }
+      refreshSelection();
+    };
+    const text = el("span", { fontSize: "12px" });
+    text.textContent = `#${inst.instanceNumber ?? "?"}`;
+    line.appendChild(box);
+    line.appendChild(text);
+    line.onmouseenter = () => (line.style.background = "#1b2438");
+    line.onmouseleave = () => (line.style.background = "transparent");
+    line.onclick = () => showPreview(series, inst, label);
+
+    return line;
+  }
+
+  // ── プレビュー / レンダリング ───────────────────────────────
+
+  /**
+   * インスタンスを JAR 面でレンダリングして PNG を得る（結果はキャッシュ）。
+   * ここが「ui.js にはできず、バックエンド面にはできる」ことの実演。
+   */
+  async function renderInstance(seriesUid, sopUid) {
+    const cached = rendered.get(sopUid);
+    if (cached) return cached;
+    const res = /** @type {any} */ (
+      await host.runBackend({
+        op: "render",
+        apiOrigin: API_ORIGIN,
+        studyUid,
+        seriesUid,
+        sopUid,
+        maxEdge: RENDER_EDGE,
+      })
+    );
+    if (!res || !res.ok) throw new Error((res && res.error) || "レンダリングに失敗しました");
+    const shot = {
+      base64: res.base64,
+      mimeType: res.mimeType || "image/png",
+      dataUrl: `data:${res.mimeType || "image/png"};base64,${res.base64}`,
+      width: res.width,
+      height: res.height,
+    };
+    rendered.set(sopUid, shot);
+    return shot;
+  }
+
+  async function showPreview(series, inst, label) {
+    previewCaption.textContent = label + " を読み込み中…";
+    previewImg.style.display = "none";
+    try {
+      const shot = await renderInstance(series.seriesInstanceUid, inst.sopInstanceUid);
+      previewImg.src = shot.dataUrl;
+      previewImg.style.display = "block";
+      previewCaption.textContent = `${label}（${shot.width}×${shot.height}）`;
+    } catch (e) {
+      previewCaption.textContent = explainBackendError(e);
+    }
+  }
+
+  /** 選択枚数の表示とサムネイル列を更新する。 */
+  function refreshSelection() {
+    selectionInfo.textContent =
+      selected.size === 0
+        ? `選択中: 0 枚（画像なしでも推敲できます・最大 ${MAX_IMAGES} 枚）`
+        : `選択中: ${selected.size} 枚 / 最大 ${MAX_IMAGES} 枚`;
+    thumbs.textContent = "";
+    let i = 1;
+    for (const item of selected.values()) {
+      const cell = el("div", { display: "flex", flexDirection: "column", gap: "2px", alignItems: "center" });
+      const img = document.createElement("img");
+      Object.assign(img.style, {
+        width: "64px",
+        height: "64px",
+        objectFit: "cover",
+        border: "1px solid #2a3550",
+        borderRadius: "4px",
+        background: "#000",
+      });
+      const shot = rendered.get(item.sopUid);
+      if (shot) img.src = shot.dataUrl;
+      const cap = el("div", { color: "#93a1b8", fontSize: "10.5px" });
+      cap.textContent = "画像" + i++;
+      cell.appendChild(img);
+      cell.appendChild(cap);
+      cell.title = item.label;
+      thumbs.appendChild(cell);
+    }
+  }
+
+  // ── 実行本体 ─────────────────────────────────────────────
+
   runBtn.onclick = async () => {
     const apiKey = keyInput.value.trim();
     if (!apiKey) {
@@ -315,29 +671,37 @@ function openDialog(host) {
     if (remember.box.checked) localStorage.setItem(LS_KEY, apiKey);
     else localStorage.removeItem(LS_KEY);
 
-    /** @type {Record<string, unknown>} */
-    const payload = {
-      apiKey,
-      model: modelSel.value,
-      findings: draft.value,
-    };
-    if (attach.box.checked && tiles.length > 0) {
-      const shot = captureCanvas(tiles[Number(tileSel.value)].canvas);
-      if (shot) {
-        payload.imageBase64 = shot.base64;
-        payload.mimeType = "image/png";
-      }
-    }
-
     runBtn.disabled = true;
     runBtn.style.opacity = "0.5";
-    status.textContent = "Gemini に問い合わせています…（数十秒かかることがあります）";
     result.style.display = "none";
     copyBtn.style.display = "none";
+    truncWarn.style.display = "none";
 
     try {
-      // ここがバックエンド面の呼び出し: POST /api/plugins/gemini-findings/run
-      const res = /** @type {any} */ (await host.runBackend(payload));
+      // 選択済みで未レンダリングのものをここで揃える（プレビュー済みならキャッシュが効く）。
+      const images = [];
+      let n = 0;
+      for (const item of selected.values()) {
+        n++;
+        status.textContent = `画像を準備しています… (${n}/${selected.size})`;
+        const shot = await renderInstance(item.seriesUid, item.sopUid);
+        images.push({ base64: shot.base64, mimeType: shot.mimeType, label: item.label });
+      }
+      refreshSelection();
+
+      status.textContent = "Gemini に問い合わせています…（数十秒かかることがあります）";
+      const res = /** @type {any} */ (
+        await host.runBackend({
+          op: "refine",
+          apiKey,
+          model: modelSel.value,
+          // 空なら JAR 側の既定が使われる（str(args,"instruction", DEFAULT_INSTRUCTION)）。
+          instruction: promptArea.value.trim(),
+          findings: draft.value,
+          images,
+        })
+      );
+
       if (res && res.ok) {
         result.textContent = String(res.text || "");
         result.style.display = "block";
@@ -345,21 +709,30 @@ function openDialog(host) {
         const u = res.usage;
         status.textContent =
           `完了（${res.model}${res.finishReason ? " / " + res.finishReason : ""}` +
-          (u ? ` / トークン ${u.totalTokens}` : "") +
+          ` / 画像 ${res.images ?? images.length} 枚` +
+          (u ? ` / トークン ${u.totalTokens}（思考 ${u.thoughtsTokens ?? 0}）` : "") +
           "）。内容は必ずご自身で確認してください。";
+        if (res.truncated) {
+          truncWarn.textContent =
+            "⚠ 出力が上限に達して途中で終わっています（finishReason=MAX_TOKENS）。" +
+            "ドラフトを短くするか、画像を減らして再実行してください。";
+          truncWarn.style.display = "block";
+        }
       } else {
         status.textContent = "エラー: " + ((res && res.error) || "不明なエラー");
       }
     } catch (e) {
       status.textContent = explainBackendError(e);
     } finally {
-      runBtn.disabled = false;
-      runBtn.style.opacity = "1";
+      runBtn.disabled = !consent.box.checked;
+      runBtn.style.opacity = consent.box.checked ? "1" : "0.5";
     }
   };
 
   document.body.appendChild(overlay);
   keyInput.focus();
+  refreshSelection();
+  buildTree();
 }
 
 /**
@@ -383,6 +756,18 @@ function explainBackendError(e) {
   return "呼び出しに失敗しました: " + msg;
 }
 
+// ── 表示ヘルパ ─────────────────────────────────────────────
+
+function seriesLabel(series) {
+  const parts = [series.modality, series.seriesDescription].filter(Boolean);
+  return parts.length > 0 ? parts.join(" / ") : shortUid(series.seriesInstanceUid);
+}
+
+function shortUid(uid) {
+  if (!uid) return "(unknown)";
+  return uid.length <= 18 ? uid : "…" + uid.slice(-16);
+}
+
 // ── DOM ヘルパ ─────────────────────────────────────────────
 
 function el(tag, style) {
@@ -403,6 +788,12 @@ function sectionTitle(text) {
 
 function hint(text) {
   const s = el("div", { color: "#93a1b8", fontSize: "11.5px", marginTop: "5px", lineHeight: "1.6" });
+  s.textContent = text;
+  return s;
+}
+
+function labelled(text) {
+  const s = el("span", { color: "#93a1b8" });
   s.textContent = text;
   return s;
 }

@@ -17,7 +17,17 @@
           graphy-plugin-api-<ver>.jar と一致させる。CI は -Dgraphy.version=… で上書きする。
         -->
         <graphy.version>0.1.8</graphy.version>
+        <!-- backend が同梱している dcm4che の版に合わせる（backend/pom.xml の dcm4che.version）。 -->
+        <dcm4che.version>5.34.3</dcm4che.version>
     </properties>
+
+    <!-- dcm4che は Maven Central ではなく独自リポジトリで配信される。 -->
+    <repositories>
+        <repository>
+            <id>dcm4che</id>
+            <url>https://maven.dcm4che.org</url>
+        </repository>
+    </repositories>
 
     <dependencies>
         <!--
@@ -47,6 +57,19 @@
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
             <version>2.17.2</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!--
+          dcm4che も同じ理由で provided。DICOM の読み取り（Attributes/Tag/DicomInputStream）に使う。
+          これがあるおかげで「開いていないインスタンス」をプラグインから読んでプレビューできる。
+          ⚠ Jackson と同様、本体のクラスローダに寄りかかった選択。本体が dcm4che の版を上げると
+             壊れうる（互換性の無い API 変更があった場合）。
+        -->
+        <dependency>
+            <groupId>org.dcm4che</groupId>
+            <artifactId>dcm4che-core</artifactId>
+            <version>${dcm4che.version}</version>
             <scope>provided</scope>
         </dependency>
     </dependencies>

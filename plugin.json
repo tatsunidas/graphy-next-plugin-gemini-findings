@@ -1,7 +1,7 @@
 {
   "id": "gemini-findings",
   "name": "Gemini 所見推敲",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "contributes": ["viewer2d.menu", "mainscreen.menu"],
   "ui": "ui.js",
   "entrypoint": "com.example.graphy.gemini.GeminiFindingsPlugin",

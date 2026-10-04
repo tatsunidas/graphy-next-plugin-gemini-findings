@@ -114,10 +114,13 @@ jobs:
           minisign -V -p minisign.pub -m "dist/$name.zip" -x "dist/$name.zip.minisig"
           ls -la dist
 
-      - name: Create release
+      # 本体と同じく公開はせず下書きを作る。下書きの zip を現行の公開版の本体に入れて確かめてから、
+      # 人が `gh release edit vX.Y.Z --draft=false` で公開する（下書きは利用者の本体からは見えない）。
+      - name: Create release (draft)
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
+          draft: true
           files: |
             dist/${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.ver }}.zip
             dist/${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.ver }}.zip.sha256

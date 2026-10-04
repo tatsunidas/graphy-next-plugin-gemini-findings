@@ -11,6 +11,8 @@ name: Release plugin
 on:
   push:
     tags: ["v*"]
+  # 手動実行は署名と検証までの dry-run（Release は作らない）。secrets の登録確認に使う。
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -44,7 +46,9 @@ jobs:
           id=$(jq -r .id plugin.json)
           pjver=$(jq -r .version plugin.json)
           ver="${GITHUB_REF_NAME#v}"
-          if [ "$pjver" != "$ver" ]; then
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            ver="$pjver"
+          elif [ "$pjver" != "$ver" ]; then
             echo "::error::plugin.json version ($pjver) != tag ($ver). 版とタグを一致させてください。"
             exit 1
           fi
@@ -83,13 +87,20 @@ jobs:
           (cd dist && sha256sum "$name.zip" > "$name.zip.sha256")
           ls -la dist
 
-      # 署名（任意だが強く推奨）。secrets が未登録ならこのステップは自動でスキップされる。
-      # 署名があると、利用者は 2 回目以降の更新を確認画面なしで導入できる（TOFU）。
-      - name: Sign package (optional)
-        if: ${{ env.MINISIGN_SECRET_KEY != '' }}
+      # 公式鍵（98EA7C6BA2D50118）で署名する。署名があると本体の trusted-keys で検証が通り、
+      # 利用者の導入は確認画面なしになる。secrets の登録は GRAPHY-Next の
+      # scripts/plugin-signing/graphy_sign.py setup-repo（fw/plugin-signing-runbook.md §6）。
+      # 🔴 公式プラグインは**署名なしで公開しない**: 鍵が登録されていなければリリースを止める
+      #    （署名なしでも導入はできてしまうので、「公式なのに確認画面が出る」配布物を黙って出さない）。
+      #    パスフレーズの無い鍵なら MINISIGN_PASSWORD は空でよい。
+      - name: Sign package
         run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "::error::secrets.MINISIGN_SECRET_KEY がありません（fw/plugin-signing-runbook.md §6）。公式プラグインは署名なしで公開しません。"
+            exit 1
+          fi
           if [ ! -f minisign.pub ]; then
-            echo "::error::minisign.pub がリポジトリにありません（minisign -G で作り、公開鍵だけコミットしてください）"
+            echo "::error::minisign.pub がリポジトリにありません"
             exit 1
           fi
           sudo apt-get update -qq && sudo apt-get install -y -qq minisign
@@ -99,11 +110,12 @@ jobs:
             -m "dist/$name.zip" -t "$name" -x "dist/$name.zip.minisig"
           rm -f /tmp/minisign.key
           cp minisign.pub dist/
-          # 自分の公開鍵で検証できることを確認してから公開する。
+          # 🔴 自分の公開鍵で検証できることを**公開する前に**確かめる。
           minisign -V -p minisign.pub -m "dist/$name.zip" -x "dist/$name.zip.minisig"
           ls -la dist
 
       - name: Create release
+        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
           files: |
